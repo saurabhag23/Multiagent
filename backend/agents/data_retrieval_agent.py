@@ -1,39 +1,27 @@
 import yfinance as yf
-from sec_api import QueryApi, ExtractorApi
+from sec_api import QueryApi
 import os
+import logging
 from typing import Dict, Any
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+import json
 
 class DataRetrievalAgent:
     def __init__(self):
         self.sec_api = QueryApi(api_key=os.getenv('SEC_API_KEY'))
-        self.extractor_api = ExtractorApi(api_key=os.getenv('SEC_API_KEY'))
+        logging.basicConfig(level=logging.DEBUG)
+        self.logger = logging.getLogger(__name__)
 
     def get_stock_data(self, ticker: str, period: str = "1y") -> pd.DataFrame:
-        """
-        Retrieve historical stock data from Yahoo Finance.
-        
-        Args:
-            ticker (str): The stock ticker symbol.
-            period (str): The time period to retrieve data for (e.g., "1y" for 1 year).
-        
-        Returns:
-            pd.DataFrame: Historical stock data.
-        """
+        """Retrieve historical stock data from Yahoo Finance."""
         stock = yf.Ticker(ticker)
         data = stock.history(period=period)
         return data
 
     def get_financial_statements(self, ticker: str) -> Dict[str, Any]:
-        """
-        Retrieve financial statements from SEC filings.
-        
-        Args:
-            ticker (str): The stock ticker symbol.
-        
-        Returns:
-            Dict[str, Any]: Financial statements data.
-        """
+        """Retrieve financial statements from SEC filings."""
         query = {
             "query": {
                 "query_string": {
@@ -45,119 +33,106 @@ class DataRetrievalAgent:
             "sort": [{"filedAt": {"order": "desc"}}]
         }
 
-        filings = self.sec_api.get_filings(query)
-        
-        if filings['total']['value'] == 0:
-            return {"error": "No 10-K filings found for this company."}
+        try:
+            filings = self.sec_api.get_filings(query)
+            if not filings['filings']:
+                self.logger.error("No 10-K filings found for this company.")
+                return {"error": "No 10-K filings found for this company."}
 
-        latest_10k = filings['filings'][0]
-        accession_no = latest_10k['accessionNo']
+            latest_10k = filings['filings'][0]
+            self.logger.debug(f"Latest 10-K Filing Data: {latest_10k}")
 
-        # Extract the financial tables
-        financial_data = self.extractor_api.get_financial_data(accession_no)
+            accession_no = latest_10k.get('accessionNo')
+            if not accession_no:
+                self.logger.error("Accession number not found in the 10-K filing details.")
+                return {"error": "Accession number not found in the 10-K filing details."}
 
-        # Parse the HTML content of the filing
-        html_content = self.get_filing_html(latest_10k['linkToFilingDetails'])
+            # Fetch filing HTML to extract financial data
+            filing_url = latest_10k['linkToFilingDetails']
+            html_content = self.get_filing_html(filing_url)
 
-        return {
-            "income_statement": self.parse_financial_table(financial_data, 'income_statement'),
-            "balance_sheet": self.parse_financial_table(financial_data, 'balance_sheet'),
-            "cash_flow_statement": self.parse_financial_table(financial_data, 'cash_flow_statement'),
-            "filing_date": latest_10k['filedAt'],
-            "company_name": self.extract_company_name(html_content),
-            "fiscal_year_end": self.extract_fiscal_year_end(html_content)
-        }
+            # Parse financial statements from HTML content
+            financial_data = self.parse_financial_statements(html_content)
 
-    def parse_financial_table(self, financial_data: Dict[str, Any], statement_type: str) -> pd.DataFrame:
-        """
-        Parse financial data into a DataFrame.
-        
-        Args:
-            financial_data (Dict[str, Any]): The financial data from SEC API.
-            statement_type (str): The type of financial statement.
-        
-        Returns:
-            pd.DataFrame: Parsed financial data.
-        """
-        if statement_type not in financial_data:
-            return pd.DataFrame()
-
-        data = financial_data[statement_type]
-        df = pd.DataFrame(data)
-        
-        # Pivot the DataFrame to have years as columns
-        df_pivoted = df.pivot(index='label', columns='frame', values='value')
-        
-        return df_pivoted
+            return {
+                "income_statement": financial_data.get("income_statement", {}),
+                "balance_sheet": financial_data.get("balance_sheet", {}),
+                "cash_flow_statement": financial_data.get("cash_flow_statement", {}),
+                "filing_date": latest_10k.get('filedAt'),
+                "company_name": latest_10k.get('companyName', 'Unknown')
+            }
+        except Exception as e:
+            self.logger.error(f"Error retrieving financial statements for {ticker}: {str(e)}")
+            return {"error": str(e)}
 
     def get_filing_html(self, filing_url: str) -> str:
-        """
-        Fetch the HTML content of a filing.
-        
-        Args:
-            filing_url (str): The URL of the filing.
-        
-        Returns:
-            str: The HTML content of the filing.
-        """
+        """Fetch the HTML content of a filing."""
         response = requests.get(filing_url)
         return response.text
 
-    def extract_company_name(self, html_content: str) -> str:
-        """
-        Extract the company name from the filing HTML.
-        
-        Args:
-            html_content (str): The HTML content of the filing.
-        
-        Returns:
-            str: The extracted company name.
-        """
+    def parse_financial_statements(self, html_content: str) -> Dict[str, Any]:
+        """Parse financial statements from HTML content."""
         soup = BeautifulSoup(html_content, 'html.parser')
-        company_name = soup.find('span', class_='companyName')
-        return company_name.text.strip() if company_name else "Unknown"
 
-    def extract_fiscal_year_end(self, html_content: str) -> str:
-        """
-        Extract the fiscal year end date from the filing HTML.
+        # Initialize empty dictionaries for each statement
+        income_statement = {}
+        balance_sheet = {}
+        cash_flow_statement = {}
+
+        # Example parsing logic (you may need to adjust based on actual HTML structure)
         
-        Args:
-            html_content (str): The HTML content of the filing.
-        
-        Returns:
-            str: The extracted fiscal year end date.
-        """
-        soup = BeautifulSoup(html_content, 'html.parser')
-        fiscal_year_end = soup.find('div', string=re.compile(r'Fiscal Year End:'))
-        if fiscal_year_end:
-            return fiscal_year_end.text.split(':')[1].strip()
-        return "Unknown"
+        # Extract Income Statement (example logic)
+        income_table = soup.find('table', {'summary': 'Consolidated Statements of Operations'})
+        if income_table:
+            rows = income_table.find_all('tr')
+            for row in rows:
+                cols = row.find_all('td')
+                if len(cols) > 1:
+                    label = cols[0].text.strip()
+                    value = cols[1].text.strip()
+                    income_statement[label] = value
+
+        # Extract Balance Sheet (example logic)
+        balance_table = soup.find('table', {'summary': 'Consolidated Balance Sheets'})
+        if balance_table:
+            rows = balance_table.find_all('tr')
+            for row in rows:
+                cols = row.find_all('td')
+                if len(cols) > 1:
+                    label = cols[0].text.strip()
+                    value = cols[1].text.strip()
+                    balance_sheet[label] = value
+
+        # Extract Cash Flow Statement (example logic)
+        cash_flow_table = soup.find('table', {'summary': 'Consolidated Statements of Cash Flows'})
+        if cash_flow_table:
+            rows = cash_flow_table.find_all('tr')
+            for row in rows:
+                cols = row.find_all('td')
+                if len(cols) > 1:
+                    label = cols[0].text.strip()
+                    value = cols[1].text.strip()
+                    cash_flow_statement[label] = value
+
+        return {
+            "income_statement": income_statement,
+            "balance_sheet": balance_sheet,
+            "cash_flow_statement": cash_flow_statement
+        }
 
     def get_company_profile(self, ticker: str) -> Dict[str, Any]:
-        """
-        Retrieve company profile information from Yahoo Finance.
-        
-        Args:
-            ticker (str): The stock ticker symbol.
-        
-        Returns:
-            Dict[str, Any]: Company profile information.
-        """
+        """Retrieve company profile information from Yahoo Finance."""
         stock = yf.Ticker(ticker)
         return stock.info
 
     def get_all_data(self, ticker: str) -> Dict[str, Any]:
-        """
-        Retrieve all relevant data for a given company.
-        
-        Args:
-            ticker (str): The stock ticker symbol.
-        
-        Returns:
-            Dict[str, Any]: All retrieved data.
-        """
-        return {
-            "stock_data": self.get_stock_data(ticker),
-            "financial_statements": self.get_financial_statements(ticker),
-            "company_profile": self.get_company_profile(ticker)
-        }
+        """Retrieve all relevant data for a given company."""
+        try:
+            return {
+                "stock_data": self.get_stock_data(ticker),
+                "financial_statements": self.get_financial_statements(ticker),
+                "company_profile": self.get_company_profile(ticker)
+            }
+        except Exception as e:
+            self.logger.error(f"Error in get_all_data: {str(e)}")
+            return {"error": f"An error occurred while retrieving data: {str(e)}"}

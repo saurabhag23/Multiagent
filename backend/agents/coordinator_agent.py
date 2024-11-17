@@ -1,30 +1,23 @@
-from langchain.agents import Tool, AgentExecutor, LLMSingleActionAgent, create_react_agent
-from langchain.prompts import StringPromptTemplate, PromptTemplate
+import datetime
 from langchain_openai import OpenAI as LangChainOpenAI
-from langchain_core.runnables import RunnablePassthrough
-from langchain.chains import LLMChain
+from langchain.agents import Tool, AgentExecutor, create_react_agent
+from langchain.prompts import PromptTemplate
 from typing import List, Dict, Any
 import os
+from agents.data_retrieval_agent import DataRetrievalAgent
 from agents.fundamental_agent import FundamentalAgent
 from agents.technical_agent import TechnicalAgent
-from agents.data_retrieval_agent import DataRetrievalAgent
 from agents.visualization_agent import VisualizationAgent
 from agents.statistical_agent import StatisticalAgent
+from agents.serialization_utils import serialize_result
+import logging
+import json
+import pandas as pd
+import numpy as np
 
-class CustomPromptTemplate(StringPromptTemplate):
-    template: str
-    tools: List[Tool]
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-    def format(self, **kwargs) -> str:
-        intermediate_steps = kwargs.pop("intermediate_steps")
-        thoughts = ""
-        for action, observation in intermediate_steps:
-            thoughts += action.log
-            thoughts += f"\nObservation: {observation}\nThought: "
-        kwargs["agent_scratchpad"] = thoughts
-        kwargs["tools"] = "\n".join([f"{tool.name}: {tool.description}" for tool in self.tools])
-        kwargs["tool_names"] = ", ".join([tool.name for tool in self.tools])
-        return self.template.format(**kwargs)
 class CoordinatorAgent:
     def __init__(self):
         self.llm = LangChainOpenAI(temperature=0.7)
@@ -35,7 +28,6 @@ class CoordinatorAgent:
         self.statistical_agent = StatisticalAgent()
         self.tools = self._setup_tools()
         self.prompt = self._setup_prompt()
-        self.llm_chain = LLMChain(llm=self.llm, prompt=self.prompt)
         self.agent = create_react_agent(self.llm, self.tools, self.prompt)
         self.agent_executor = AgentExecutor(agent=self.agent, tools=self.tools, verbose=True)
 
@@ -88,83 +80,47 @@ class CoordinatorAgent:
         Begin!
 
         Question: Provide a comprehensive investment analysis for {input}
-        
         {agent_scratchpad}
         """
 
         return PromptTemplate(template=template, input_variables=["tools", "tool_names", "input", "agent_scratchpad"])
-
+      
     def analyze(self, company: str) -> Dict[str, Any]:
-        # Fetch data
-        data = self.data_retrieval_agent.get_all_data(company)
+       try:
+           # Fetch data from various agents
+           data_retrieval_result = self.data_retrieval_agent.get_all_data(company)
+           
+           if 'error' in data_retrieval_result:
+               logger.error(data_retrieval_result['error'])
+               return data_retrieval_result  # Return error if retrieval failed
+
+           fundamental_result = self.fundamental_agent.analyze(company)
+           technical_result = self.technical_agent.analyze(company)
+
+           # Create visualizations based on retrieved data
+           visualizations = self.visualization_agent.create_visualizations(data_retrieval_result)
+
+           # Perform statistical analysis based on retrieved data
+           statistical_result = self.statistical_agent.analyze({
+               "stock_data": data_retrieval_result["stock_data"],
+               "financial_statements": data_retrieval_result["financial_statements"]
+           })
+
+           # Compile final report (you can customize this further)
+           final_report = {
+               'company_name': company,
+               'financial_statements': data_retrieval_result['financial_statements'],
+               'fundamental_analysis': fundamental_result,
+               'technical_analysis': technical_result,
+               'visualizations': visualizations,
+               'statistical_analysis': statistical_result,
+               'fiscal_year_end': data_retrieval_result.get('fiscal_year_end', 'Unknown'),
+               'filing_date': data_retrieval_result.get('filing_date', 'Unknown')
+           }
+           
+            
+           return serialize_result(final_report)
         
-        # Create visualizations
-        visualizations = self.visualization_agent.create_visualizations(data)
-        
-        # Perform analyses
-        fundamental_result = self.fundamental_agent.analyze(company)
-        technical_result = self.technical_agent.analyze(company)
-        
-        # Perform statistical analysis
-        statistical_result = self.statistical_agent.analyze({
-            "stock_data": data["stock_data"],
-            "financial_statements": data["financial_statements"]
-        })
-        statistical_interpretation = self.statistical_agent.interpret_results(statistical_result)
-
-        # Run the agent executor for overall analysis and coordination
-        coordinator_summary = self.agent_executor.run(company)
-
-        # Compile final report
-        final_report = self.compile_final_report(
-            company, 
-            coordinator_summary, 
-            fundamental_result, 
-            technical_result, 
-            statistical_result, 
-            statistical_interpretation
-        )
-
-        return {
-            "company": company,
-            "coordinator_summary": coordinator_summary,
-            "fundamental_analysis": fundamental_result,
-            "technical_analysis": technical_result,
-            "statistical_analysis": statistical_result,
-            "statistical_interpretation": statistical_interpretation,
-            "visualizations": visualizations,
-            "final_report": final_report
-        }
-
-    def compile_final_report(self, company: str, coordinator_summary: str, 
-                             fundamental_result: Dict[str, Any], technical_result: Dict[str, Any], 
-                             statistical_result: Dict[str, Any], statistical_interpretation: str) -> str:
-        prompt = f"""
-        As a senior investment analyst, compile a comprehensive final report for {company} based on the following information:
-
-        Coordinator's Summary:
-        {coordinator_summary}
-
-        Fundamental Analysis:
-        {fundamental_result['analysis']}
-
-        Technical Analysis:
-        {technical_result['analysis']}
-
-        Statistical Analysis:
-        {statistical_interpretation}
-
-        Your report should include:
-        1. An executive summary
-        2. Key findings from the fundamental analysis
-        3. Key findings from the technical analysis
-        4. Key findings from the statistical analysis
-        5. An overall investment recommendation (Buy, Hold, or Sell)
-        6. Potential risks and opportunities
-        7. A conclusion summarizing the main points
-
-        The report should be well-structured, easy to read, and provide actionable insights for potential investors.
-        """
-
-        final_report = self.llm(prompt)
-        return final_report
+       except Exception as e:
+           logger.error(f"Error in analyze method: {str(e)}")
+           return {"error": f"An error occurred during analysis: {str(e)}"}
